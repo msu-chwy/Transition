@@ -1,0 +1,92 @@
+-- Capture all events of the experiment
+create or replace temp table ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS as (
+select * from ECOM_SANDBOX.PCA_CLICKSTREAM_EXPERIMENT_EVENT
+where experiment = '2024_03_PDP_BUYBOX_FTAS'
+and session_date between '2024-03-07' and '2024-03-14'
+);
+
+-- Autoship Flag
+---- Orders
+CREATE OR REPLACE local temp TABLE ecom_sandbox.sfw_exp_as_orders AS
+select 
+    h.session_id, 
+    h.order_id,
+    h.new_customer_flag,
+    o.order_auto_reorder_subscription_first_placed_flag as new_parent_sub_flag,
+    case when new_parent_sub_flag=True and new_customer_flag=True then True else False end as NCNA_Flag,
+    case when new_parent_sub_flag=True and new_customer_flag=False then True else False end as ECNA_Flag,
+    case when h.event_label in ('FirstOrder-Autoship','RepeatOrder-Autoship') then TRUE else FALSE end as AS_Flag
+FROM ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS h
+inner join ecom.orders o on o.order_id = h.order_id 
+where event_action = 'purchase' AND h.order_id IS NOT NULL
+group by 1,2,3,4,5,6,7
+order by session_id;
+
+---- Eligible Orders
+CREATE OR REPLACE local temp TABLE ecom_sandbox.sfw_exp_as_eligible_orders AS
+select session_id, a.order_id, 
+max(case when pd.disallow_recurring_flag = TRUE then FALSE else TRUE end) as autoship_eligible_order
+from ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS a
+inner join pdm.product pd on pd.product_id = a.product_id
+where event_action = 'purchase' AND a.order_id IS NOT NULL
+group by 1,2;
+
+---- Has tried autoship
+CREATE OR REPLACE local temp TABLE ecom_sandbox.sfw_exp_has_tried_autoship AS
+select distinct session_id, has_tried_autoship
+from segment.segment_hits
+where session_date_est between '2024-03-07' and '2024-03-14'
+and session_id in (select distinct session_id from ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS);
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS_final AS
+select a.*, b.has_tried_autoship
+from ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS a
+left join ecom_sandbox.sfw_exp_has_tried_autoship b
+on a.session_id=b.session_id;
+
+-- CREATE AGGREGATE TABLE
+CREATE OR REPLACE local temp TABLE ecom_sandbox.sfw_exp_final_aggregate AS
+SELECT
+    variation,
+    device_category,
+    a.new_customer_flag,
+    active_autoship_flag,
+    -- channel,
+    count(distinct a.session_id) as sessions,
+-- Autoship sign-up rate
+    count(distinct case when has_tried_autoship = False then a.session_id end) as has_not_tried_autoship_sessions,
+    count(distinct case when (NCNA_Flag = True or ECNA_Flag = True) then a.session_id end) as NCNA_ECNA_transaction_sessions,
+-- Autoship order rate
+    count(distinct case when AS_Flag=True then a.order_id end) as autoship_orders,
+    count(distinct case when autoship_eligible_order=True then a.order_id end) as autoship_eligible_orders,
+-- Autoship order CVR
+    count(distinct case when a.order_id is not null and AS_Flag=True then a.session_id end) as autoship_transaction_sessios
+from ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS_final a
+left join ecom_sandbox.sfw_exp_as_orders o 
+on o.session_id = a.session_id
+left join ecom_sandbox.sfw_exp_as_eligible_orders e
+on e.order_id=a.order_id
+group by 1,2,3,4;
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.sfw_exp_final_aggregate_mc1 AS
+SELECT
+    variation,
+    PRODUCT_MERCH_CLASSIFICATION1,
+    count(distinct a.session_id) as sessions,
+-- Autoship sign-up rate
+    count(distinct case when has_tried_autoship = False then a.session_id end) as has_not_tried_autoship_sessions,
+    count(distinct case when (NCNA_Flag = True or ECNA_Flag = True) then a.session_id end) as NCNA_ECNA_transaction_sessions,
+-- Autoship order rate
+    count(distinct case when AS_Flag=True then a.order_id end) as autoship_orders,
+    count(distinct case when autoship_eligible_order=True then a.order_id end) as autoship_eligible_orders,
+-- Autoship order CVR
+    count(distinct case when a.order_id is not null and AS_Flag=True then a.session_id end) as autoship_transaction_sessios
+from ecom_sandbox.temp_exp_2024_03_PDP_BUYBOX_FTAS_final a
+left join ecom_sandbox.sfw_exp_as_orders o 
+on o.session_id = a.session_id
+left join ecom_sandbox.sfw_exp_as_eligible_orders e
+on e.order_id=a.order_id
+group by 1,2;
+
+select * from ecom_sandbox.sfw_exp_final_aggregate;
+select * from ecom_sandbox.sfw_exp_final_aggregate_mc1;
