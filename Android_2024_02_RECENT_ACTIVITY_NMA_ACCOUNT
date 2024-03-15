@@ -1,0 +1,351 @@
+
+-- In this script, we used PID to check spillover, used nma_linker_id to join with segment table and get all event after activation
+
+-- set parameters
+
+use warehouse ECOM_WH;
+use schema ecom_sandbox;
+
+SET start_date = '2024-02-20';
+SET end_date = '2024-03-04';
+SET exp_name1 = 'android_accountquicklinks_enabled';
+SET exp_name2 = 'android_accountrecentactivity_enabled';
+
+BEGIN;
+
+-- get current date activations
+CREATE OR REPLACE local temp TABLE ecom_sandbox.daily_activation AS
+SELECT
+    event_action                    AS experiment,
+    event_label                     AS variation,
+    event_category                  AS experiment_tool,
+    session_date_est AS session_date,
+    a.session_id,
+    dataset AS device_category,
+    channel_grouping_last_non_direct_last_channel AS channel,
+    active_autoship_derived AS active_autoship_flag,
+    new_customer_flag,
+    app_version,
+    nma_linker_id AS EXP_USER_ID,
+    personalization_id,
+    CUSTOMER_ID,
+    nma_linker_id,
+    event_id,
+    event_timestamp,
+    event_name,
+    dw_site_id
+FROM
+    segment.segment_nma_hits_unified AS a
+WHERE 
+  session_date_est between $start_date and $end_date
+  AND dataset IN ('android')
+  AND event_action IN ($exp_name1, $exp_name2)
+  AND event_name IN ('Experiment Activated',
+                     'Experiment Seen')
+  AND EXP_USER_ID IS NOT NULL
+;
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.running_exp_activations AS
+SELECT
+    experiment,
+    variation,
+    experiment_tool,
+    session_date,
+    session_id,
+    device_category,
+    channel,
+    active_autoship_flag,
+    new_customer_flag,
+    app_version,
+    EXP_USER_ID,
+    personalization_id,
+    customer_id,
+    nma_linker_id,
+    event_id,
+    event_timestamp,
+    event_name,
+    Same_Session_Spillover_Flag,
+    CID_Spillover_Flag,
+    EXP_USER_ID_Spillover_Flag,
+    CASE 
+        WHEN count_if(Spillover_Flag)OVER(partition BY experiment, exp_user_id) > 0 
+            THEN True 
+            ELSE False 
+            END AS Spillover_Flag,
+    event_rank,
+    dw_site_id,
+    case
+        when dw_site_id = 10 then 'united states'
+        when dw_site_id = 60 then 'canada'
+        else 'other'
+        end as dw_site_name
+FROM 
+    (
+    SELECT 
+        *,
+        CASE
+            WHEN COUNT(DISTINCT variation)over(partition BY experiment, session_id) > 1
+                THEN True
+            ELSE False
+            END AS Same_Session_Spillover_Flag,
+        CASE
+            WHEN COUNT(DISTINCT variation)over(partition BY exp_user_id, experiment) > 1
+                THEN True
+            ELSE False
+            END AS EXP_USER_ID_Spillover_Flag,
+        CASE
+            WHEN COUNT(DISTINCT case when customer_id is not null then variation end)over(partition BY customer_id, experiment) > 1
+             THEN True
+            ELSE False
+            END AS CID_Spillover_Flag,
+        CASE
+            WHEN Same_Session_Spillover_Flag
+                OR  EXP_USER_ID_Spillover_Flag
+                OR  CID_Spillover_Flag
+                THEN True
+            ELSE False
+            END AS Spillover_Flag,
+        dense_rank()over(partition BY EXP_USER_ID, experiment ORDER BY event_timestamp,
+            event_name) AS event_rank
+    FROM
+        (
+        /*SELECT 
+            experiment,
+            variation,
+            experiment_tool,
+            session_date,
+            session_id,
+            device_category,
+            channel,
+            active_autoship_flag,
+            new_customer_flag,
+            app_version,
+            EXP_USER_ID,
+            personalization_id,
+            customer_id,
+            nma_linker_id,
+            event_id,
+            event_timestamp,
+            event_name,
+            dw_site_id
+        FROM 
+            ECOM_SANDBOX.PCA_CLICKSTREAM_HOMEPAGE_HYBRID_MIGRATION_EXPERIMENT_ACTIVATION_QA
+        WHERE 
+            session_date < $data_date and 
+            experiment IN ($exp_name1, $exp_name2)
+        UNION ALL*/
+        SELECT * FROM ecom_sandbox.daily_activation
+        )
+    )
+;
+
+-- Variation
+CREATE OR REPLACE local temp TABLE ecom_sandbox.temp_variation as
+SELECT 
+  session_id,
+  CASE 
+    WHEN SUM(CASE WHEN experiment = 'android_accountquicklinks_enabled' AND variation = 'false' THEN 1 ELSE 0 END) > 0
+         AND SUM(CASE WHEN experiment = 'android_accountrecentactivity_enabled' AND variation = 'false' THEN 1 ELSE 0 END) > 0 THEN 'control'
+    WHEN SUM(CASE WHEN experiment = 'android_accountquicklinks_enabled' AND variation = 'true' THEN 1 ELSE 0 END) > 0
+         AND SUM(CASE WHEN experiment = 'android_accountrecentactivity_enabled' AND variation = 'true' THEN 1 ELSE 0 END) > 0 THEN 'treatment'
+    ELSE 'other' 
+  END AS exp_variation
+FROM 
+  ecom_sandbox.running_exp_activations
+GROUP BY 
+  session_id;
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.running_exp_activations_with_variation AS
+SELECT
+   a.*,
+   b.exp_variation
+from ecom_sandbox.running_exp_activations a
+left join ecom_sandbox.temp_variation b
+on a.session_id=b.session_id;
+
+
+CREATE OR REPLACE local temp TABLE ecom_sandbox.daily_event AS
+-- get merch sales
+WITH financial_metrics AS (
+    SELECT
+        order_id
+        ,part_number
+        ,product_id
+        ,sum(order_line_total_price) as merch_sales
+        ,sum(order_line_quantity) as units
+        ,sum(coalesce(order_line_total_price,0)
+        + coalesce(order_line_ship_charge,0)
+        + coalesce(order_line_total_adjustment,0)
+        + coalesce(refund_credit_amount,0)
+        + coalesce(appeasement_credit_amount,0))
+        + sum(coalesce(raw_product_cost,0)
+        + coalesce(order_line_royalty_amount,0)
+        + coalesce(inventory_adjustment_cost,0)
+        + coalesce(autoship_reimbursements,0)
+        + coalesce(rebate_amount,0)
+        + coalesce(shipment_net_charge_allocation, 0)
+        + coalesce(shipment_net_charge_allocation_default, 0)
+        + coalesce(corrugate_cost,0)) as gross_profit
+    from
+        ecom.order_line
+    where
+        order_placed_dttm_est::date between DATEADD(Day ,-1, $start_date) and DATEADD(Day ,+1, $end_date) -- just trying to account for any backend synchronization issues
+        and business_channel_name ilike any ('%ios%', '%android%', '%web%')
+    group by
+        1,2,3
+)
+SELECT 
+    experiment,
+    variation,
+    exp_variation,
+    a.*,
+    merch_sales,
+    units,
+    part_number,
+    gross_profit
+FROM (
+	SELECT 
+        session_date_est AS session_date,
+		session_id,
+		--dataset AS device_category,
+        --channel_grouping_last_non_direct_last_channel AS channel,
+        --COALESCE(active_autoship_derived, false) as active_autoship_flag,
+        --new_customer_flag,
+        nma_linker_id AS EXP_USER_ID,
+        nma_linker_id,
+		personalization_id AS PID,
+		TRY_CAST(customer_id AS INT) AS customer_id,
+		event_id,
+		event_timestamp,
+		event_name,
+		event_category,
+		event_action,
+		event_label,
+        event_type,
+		row_type,
+		p.product_id,
+		--product_merch_classification1,
+		--product_merch_classification2,
+		order_id,
+		revenue,
+		product_quantity,
+		page_type,
+        properties,
+        dw_site_id,
+        case
+            when dw_site_id = 10 then 'united states'
+            when dw_site_id = 60 then 'canada'
+            else 'other'
+            end as dw_site_name,
+        order_type,
+        product_price,
+        screen_name,
+        path_name,
+        widget_description,
+        --is_entrance,
+        --is_exit,
+        --is_bounce,
+        event_source
+        --app_version
+	FROM segment.segment_nma_hits_products_union_unified u
+    LEFT JOIN 
+        (SELECT part_number, product_id FROM pdm.product) p
+        on p.part_number = u.product_sku
+	WHERE session_date between $start_date and $end_date
+	) AS a
+INNER JOIN (
+	SELECT 
+        event_timestamp,
+		experiment,
+		variation,
+        exp_variation,
+		EXP_USER_ID
+	FROM ecom_sandbox.running_exp_activations_with_variation
+	WHERE NOT Spillover_Flag AND event_rank = 1
+	) AS b
+	ON a.EXP_USER_ID = b.EXP_USER_ID 
+    AND timediff(milliseconds, a.event_timestamp, b.event_timestamp) < 1000
+LEFT JOIN
+    financial_metrics f
+    ON a.order_id = f.order_id
+    AND a.product_id = f.product_id
+;
+
+-- Aggregation
+CREATE OR REPLACE local temp TABLE ecom_sandbox.nma_exp_before_final as
+SELECT
+    --session_date,
+    --experiment,
+    --Variation,
+    exp_variation,
+    --device_category,
+    --channel,
+    --exp_user_id,
+    --session_id,
+    --app_version,
+    --min(new_customer_flag) as new_customer_flag,
+    --max(active_autoship_flag) as active_autoship_flag,
+    COUNT(DISTINCT a.session_id) as sessions,
+    COUNT(DISTINCT 
+           CASE
+              WHEN 
+              event_action = 'purchase' AND order_id IS NOT NULL
+              -- AND row_type <> 'product'
+              THEN order_id
+           END) AS Orders,
+    SUM(
+            CASE
+                WHEN event_action = 'purchase' 
+                    --and row_type <> 'product' -- non-product info rows to prevent double counting when joining with order_line
+                    AND order_id IS NOT NULL
+                    AND EXPERIMENT IN ('android_accountquicklinks_enabled')
+                    THEN merch_sales
+                ELSE 0
+                END) AS total_merch_sales,
+    SUM(
+            CASE
+                WHEN event_action = 'purchase' 
+                    --and row_type <> 'product' -- non-product info rows to prevent double counting when joining with order_line
+                    AND order_id IS NOT NULL
+                    AND EXPERIMENT IN ('android_accountquicklinks_enabled')
+                    THEN units
+                ELSE 0
+                END) AS total_units
+FROM
+    --ecom_sandbox.daily_event a
+    ECOM_SANDBOX.TEMP_EXP_RECENT_ACTIVITY_ANDROID a
+WHERE session_date BETWEEN $start_date and $end_date and exp_variation in ('control','treatment')
+GROUP BY
+    1
+    --,2,3
+;
+
+select * from ecom_sandbox.nma_exp_before_final;
+
+SELECT
+    exp_variation,
+    count(distinct case when screen_name ilike any( 'account%', 'order%history', 'order%details',                       
+                          'track%package','track-order', 'my%pets', 'favorites', 
+                          'buy%again', 'notifications','order%cancel','hybrid%prescriptions',
+                          'reset%password', '%payment%','%address%', 'add%pet', 'edit%pet',
+                          'message%us', 'my%vets', '%privacy%')
+             and event_name = 'Screen Viewed' then event_id end) as account_pageviews,
+    count(distinct case when screen_name ilike any( 'account%', 'order%history', 'order%details',                       
+                          'track%package','track-order', 'my%pets', 'favorites', 
+                          'buy%again', 'notifications','order%cancel','hybrid%prescriptions',
+                          'reset%password', '%payment%','%address%', 'add%pet', 'edit%pet',
+                          'message%us', 'my%vets', '%privacy%')
+             and event_name = 'Screen Viewed' then session_id end) as account_pageview_sessions    
+FROM
+    --ecom_sandbox.daily_event a
+    ECOM_SANDBOX.TEMP_EXP_RECENT_ACTIVITY_ANDROID a
+WHERE session_date BETWEEN $start_date and $end_date and exp_variation in ('control','treatment')
+GROUP BY
+    1
+    --,2,3
+;
+
+CREATE OR REPLACE TABLE ECOM_SANDBOX.TEMP_EXP_RECENT_ACTIVITY_ANDROID AS
+SELECT * FROM ecom_sandbox.daily_event; 
+
+commit;
