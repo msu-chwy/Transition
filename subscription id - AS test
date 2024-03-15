@@ -1,0 +1,18 @@
+set test_start = date('2024-TK-TK'); --start day of NFDs 
+set test_end = date('2024-TK-TK'); --end day of NFDs
+
+with cust_excl as (
+select distinct sub.customer_id
+from cdm.subscription_lines sub
+left join pdm.product p on p.product_id = sub.product_id
+where category_level2 in ('Treats', 'Toys')
+and upper(status) = upper('Active')
+)
+select distinct sub.subscription_id, sub.customer_id
+from cdm.subscription_lines sub
+left join pdm.product p on p.product_id = sub.product_id
+where upper(status) = upper('Active')
+and p.merch_classification2 in ('Core Food')
+and sub.customer_id not in (select distinct customer_id from cust_excl)
+and next_fulfillment_dttm between $test_start and $test_end
+;
